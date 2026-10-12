@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""
+Nhận diện số viết tay 10–20 bằng:
+tách ảnh -> chuẩn hóa từng chữ -> MLP 784-256-128-64-10.
+
+Yêu cầu: pip install numpy pillow
+CSV huấn luyện: cột đầu là nhãn 0..9, tiếp theo là 784 pixel (MNIST).
+"""
+
+import argparse
+import csv
+import math
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+
+INPUT_SIZE = 28 * 28
+HIDDEN1 = 512
+HIDDEN2 = 256
+HIDDEN3 = 128
+HIDDEN_SIZES = (HIDDEN1, HIDDEN2, HIDDEN3)
+OUTPUT_SIZE = 10
+ALPHA = 0.001
+BETA1 = 0.9
+BETA2 = 0.999
+WEIGHT_DECAY = 1e-8
+DROPOUT_RATE = 0.2
+DROP_OUT_LAST_HIDDEN_LAYERS = 2
+LR_DECAY = 0.9
+EPOCHS = 20
+BATCH_SIZE = 64
+OUTPUT_DIR = Path("digit_test")
+
+
+class MLP:
+    def __init__(self, seed=42, hidden_sizes=HIDDEN_SIZES,
+                 activation="silu", dropout_rate=DROPOUT_RATE):
+        rng = np.random.default_rng(seed)
+        self.rng = rng
+        self.activation = activation
+        self.dropout_rate = float(dropout_rate)
+        if activation not in ("relu", "silu"):
+            raise ValueError("activation phải là 'relu' hoặc 'silu'.")
+        self.hidden_sizes = tuple(hidden_sizes)
+        dimensions = [INPUT_SIZE, *self.hidden_sizes, OUTPUT_SIZE]
+
+        # He initialization cho từng ma trận trọng số.
+        self.weights = []
+        self.biases = []
+        for fan_in, fan_out in zip(dimensions[:-1], dimensions[1:]):
+            weight = (rng.standard_normal((fan_in, fan_out)) *
+                      math.sqrt(2.0 / fan_in)).astype(np.float32)
+            self.weights.append(weight)
+            self.biases.append(np.zeros((1, fan_out), dtype=np.float32))
+
+        # v_* và s_* lần lượt là moment bậc nhất và bậc hai cho dW, db.
+        self.v_dw = [np.zeros_like(w) for w in self.weights]
+        self.s_dw = [np.zeros_like(w) for w in self.weights]
+        self.v_db = [np.zeros_like(b) for b in self.biases]
+        self.s_db = [np.zeros_like(b) for b in self.biases]
+        self.step = 0
+
+    @staticmethod
+    def silu(x):
+        clipped = np.clip(x, -60.0, 60.0)
+        return x / (1.0 + np.exp(-clipped))
+
+    @staticmethod
+    def silu_derivative(x):
+        sigmoid = 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
+        return sigmoid + x * sigmoid * (1.0 - sigmoid)
+
+    @staticmethod
+    def softmax(logits):
+        shifted = logits - np.max(logits, axis=1, keepdims=True)
+        exps = np.exp(shifted)
+        return exps / np.sum(exps, axis=1, keepdims=True)
+
+    def forward(self, x, training=False):
+        activations = [x]
+        pre_activations = []
+        dropout_masks = []
+        hidden_count = len(self.weights) - 1
+        first_dropout_layer = max(0, hidden_count - DROP_OUT_LAST_HIDDEN_LAYERS)
+        for layer, (weight, bias) in enumerate(
+                zip(self.weights[:-1], self.biases[:-1])):
+            z = activations[-1] @ weight + bias
+            pre_activations.append(z)
+            if self.activation == "silu":
+                activation = self.silu(z)
+            else:
+                activation = np.maximum(z, 0.0)
+
+            mask = None
+            if training and layer >= first_dropout_layer and self.dropout_rate > 0:
+                # Inverted dropout: giữ kỳ vọng activation ổn định khi train.
+                mask = (self.rng.random(activation.shape) >= self.dropout_rate)
+                mask = mask.astype(np.float32) / (1.0 - self.dropout_rate)
+                activation = activation * mask
+            dropout_masks.append(mask)
+            activations.append(activation)
+
+        logits = activations[-1] @ self.weights[-1] + self.biases[-1]
+        pre_activations.append(logits)
+        return activations, pre_activations, dropout_masks, self.softmax(logits)
+
+    def train_batch(self, x, y, learning_rate):
+        n = x.shape[0]
+        activations, pre_activations, dropout_masks, probs = self.forward(
+            x, training=True
+        )
+
+        # Softmax + cross-entropy
+        dz = probs.copy()
+        dz[np.arange(n), y] -= 1.0
+        dz /= n
+
+        dW = [None] * len(self.weights)
+        db = [None] * len(self.biases)
+        dW[-1] = activations[-1].T @ dz
+        db[-1] = np.sum(dz, axis=0, keepdims=True)
+
+        for layer in range(len(self.weights) - 2, -1, -1):
+            da = dz @ self.weights[layer + 1].T
+            if dropout_masks[layer] is not None:
+                da *= dropout_masks[layer]
+            if self.activation == "silu":
+                dz = da * self.silu_derivative(pre_activations[layer])
+            else:
+                dz = da * (pre_activations[layer] > 0)
+            dW[layer] = activations[layer].T @ dz
+            db[layer] = np.sum(dz, axis=0, keepdims=True)
+
+        self.step += 1
+
+        for layer in range(len(self.weights)):
+            # Adam cho dW: v_dw, s_dw tương ứng với v_dw, s_dw trong slide.
+            self.v_dw[layer] *= BETA1
+            self.v_dw[layer] += (1.0 - BETA1) * dW[layer]
+            self.s_dw[layer] *= BETA2
+            self.s_dw[layer] += (1.0 - BETA2) * (dW[layer] * dW[layer])
+            v_dw_corrected = self.v_dw[layer] / (1.0 - BETA1 ** self.step)
+            s_dw_corrected = self.s_dw[layer] / (1.0 - BETA2 ** self.step)
+            self.weights[layer] -= learning_rate * v_dw_corrected / np.sqrt(
+                s_dw_corrected + 1e-8
+            )
+            # AdamW: decay tách rời, chỉ áp dụng cho ma trận W.
+            self.weights[layer] *= (1.0 - learning_rate * WEIGHT_DECAY)
+
+            # Adam cho db: các moment v_db, s_db của bias cũng được cập nhật.
+            self.v_db[layer] *= BETA1
+            self.v_db[layer] += (1.0 - BETA1) * db[layer]
+            self.s_db[layer] *= BETA2
+            self.s_db[layer] += (1.0 - BETA2) * (db[layer] * db[layer])
+            v_db_corrected = self.v_db[layer] / (1.0 - BETA1 ** self.step)
+            s_db_corrected = self.s_db[layer] / (1.0 - BETA2 ** self.step)
+            self.biases[layer] -= learning_rate * v_db_corrected / np.sqrt(
+                s_db_corrected + 1e-8
+            )
+
+        loss = -np.mean(np.log(np.maximum(probs[np.arange(n), y], 1e-12)))
+        accuracy = np.mean(np.argmax(probs, axis=1) == y)
+        return float(loss), float(accuracy)
+
+    def predict_proba(self, x):
+        return self.forward(x)[-1]
+
+    def evaluate(self, x, y, batch_size=1024):
+        total_loss = 0.0
+        correct = 0
+        for start in range(0, len(y), batch_size):
+            xb = x[start:start + batch_size]
+            yb = y[start:start + batch_size]
+            probs = self.predict_proba(xb)
+            chosen = probs[np.arange(len(yb)), yb]
+            total_loss += -np.log(np.maximum(chosen, 1e-12)).sum()
+            correct += int(np.sum(np.argmax(probs, axis=1) == yb))
+        return total_loss / len(y), correct / len(y)
+
+    def save(self, filename):
+        state = {"num_layers": np.array(len(self.weights)),
+                 "hidden_sizes": np.array(self.hidden_sizes, dtype=np.int64),
+                 "activation": np.array(self.activation),
+                 "dropout_rate": np.array(self.dropout_rate)}
+        for i, (weight, bias) in enumerate(zip(self.weights, self.biases), 1):
+            state[f"W{i}"] = weight
+            state[f"b{i}"] = bias
+        np.savez(filename, **state)
+
+    @classmethod
+    def load(cls, filename):
+        data = np.load(filename)
+        num_layers = int(data["num_layers"]) if "num_layers" in data else 3
+        weights = [data[f"W{i}"].astype(np.float32)
+                   for i in range(1, num_layers + 1)]
+        biases = [data[f"b{i}"].astype(np.float32)
+                  for i in range(1, num_layers + 1)]
+        hidden_sizes = tuple(w.shape[1] for w in weights[:-1])
+        activation = str(data["activation"].item()) if "activation" in data else "relu"
+        dropout_rate = float(data["dropout_rate"]) if "dropout_rate" in data else 0.0
+        model = cls(hidden_sizes=hidden_sizes, activation=activation,
+                    dropout_rate=dropout_rate)
+        model.weights, model.biases = weights, biases
+        model.v_dw = [np.zeros_like(w) for w in weights]
+        model.s_dw = [np.zeros_like(w) for w in weights]
+        model.v_db = [np.zeros_like(b) for b in biases]
+        model.s_db = [np.zeros_like(b) for b in biases]
+        return model
+
+
+def load_mnist_csv(filename):
+    """Đọc CSV: label,pixel0,...,pixel783; nhãn phải là 0..9."""
+    print(f"Đang đọc {filename} ...")
+    rows = []
+    malformed = 0
+    with open(filename, "r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.reader(file)
+        next(reader, None)  # bỏ dòng tiêu đề
+        for row in reader:
+            if len(row) != INPUT_SIZE + 1:
+                malformed += 1
+                continue
+            try:
+                rows.append([float(value) for value in row])
+            except ValueError:
+                malformed += 1
+    if not rows:
+        raise ValueError("CSV không có dòng dữ liệu hợp lệ (cần 785 cột mỗi dòng).")
+    if malformed:
+        print(f"Bỏ qua {malformed} dòng lỗi/không đủ 785 cột trong CSV.")
+    data = np.asarray(rows, dtype=np.float32)
+    if data.ndim != 2 or data.shape[1] != INPUT_SIZE + 1:
+        raise ValueError(
+            f"CSV cần có 785 cột (label + 784 pixel), đang có "
+            f"{data.shape[1] if data.ndim == 2 else 'định dạng không hợp lệ'}."
+        )
+
+    labels = data[:, 0].astype(np.int64)
+    if np.any((labels < 0) | (labels > 9)):
+        raise ValueError("CSV huấn luyện chữ số đơn phải có nhãn từ 0 đến 9.")
+
+    images = data[:, 1:] / 255.0
+    return images.astype(np.float32), labels
+
+
+def augment_mnist_batch(images, rng):
+    """Xoay nhẹ và dịch ảnh MNIST vài pixel, không thay đổi nhãn."""
+    augmented = np.empty_like(images, dtype=np.float32)
+    for index, flat_image in enumerate(images):
+        image = np.clip(flat_image.reshape(28, 28) * 255.0, 0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(image, mode="L")
+        transformed = pil_image.rotate(
+            float(rng.uniform(-8.0, 8.0)),
+            resample=Image.Resampling.BILINEAR,
+            translate=(int(rng.integers(-2, 3)), int(rng.integers(-2, 3))),
+            fillcolor=0,
+        )
+        augmented[index] = np.asarray(transformed, dtype=np.float32).reshape(-1) / 255.0
+    return augmented
+
+
+def train(csv_path, model_path=None, plot_path=None, history_path=None,
+          hidden_sizes=HIDDEN_SIZES, dropout_rate=DROPOUT_RATE):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    model_path = model_path or str(OUTPUT_DIR / "digit_mlp.npz")
+    plot_path = plot_path or str(OUTPUT_DIR / "training_curves.png")
+    history_path = history_path or str(OUTPUT_DIR / "training_history.npz")
+    x, y = load_mnist_csv(csv_path)
+
+    rng = np.random.default_rng(42)
+    order = rng.permutation(len(y))
+    val_count = max(1, int(0.1 * len(y)))
+    val_ids, train_ids = order[:val_count], order[val_count:]
+    x_val, y_val = x[val_ids], y[val_ids]
+    x_train, y_train = x[train_ids], y[train_ids]
+
+    model = MLP(seed=42, hidden_sizes=hidden_sizes, dropout_rate=dropout_rate)
+    history = {"train_loss": [], "val_loss": [],
+               "train_accuracy": [], "val_accuracy": [], "learning_rate": []}
+    best_val_accuracy = -1.0
+    best_weights, best_biases = None, None
+    # Đo train metrics trên một tập con cố định để biểu đồ nhanh và so sánh được.
+    metric_count = min(5000, len(x_train))
+    x_train_metric, y_train_metric = x_train[:metric_count], y_train[:metric_count]
+
+    for epoch in range(EPOCHS):
+        current_lr = ALPHA * (LR_DECAY ** epoch)
+        perm = rng.permutation(len(y_train))
+
+        for start in range(0, len(perm), BATCH_SIZE):
+            ids = perm[start:start + BATCH_SIZE]
+            batch_x = augment_mnist_batch(x_train[ids], rng)
+            model.train_batch(batch_x, y_train[ids], current_lr)
+
+        train_loss, train_accuracy = model.evaluate(x_train_metric, y_train_metric)
+        val_loss, val_accuracy = model.evaluate(x_val, y_val)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_accuracy"].append(train_accuracy)
+        history["val_accuracy"].append(val_accuracy)
+        history["learning_rate"].append(current_lr)
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            best_weights = [weight.copy() for weight in model.weights]
+            best_biases = [bias.copy() for bias in model.biases]
+            best_epoch = epoch + 1
+        print(
+            f"Epoch {epoch + 1}/{EPOCHS} | "
+            f"train loss={train_loss:.4f} | val loss={val_loss:.4f} | "
+            f"train acc={train_accuracy:.4f} | val acc={val_accuracy:.4f} | "
+            f"lr={current_lr:.6f}"
+        )
+
+    # Lưu checkpoint từ epoch validation tốt nhất, không mặc định lấy epoch cuối.
+    model.weights, model.biases = best_weights, best_biases
+    model.save(model_path)
+    print(f"Đã lưu mô hình (epoch tốt nhất {best_epoch}, "
+          f"val acc={best_val_accuracy:.4%}): {model_path}")
+    np.savez(history_path, **history,
+             hidden_sizes=np.asarray(hidden_sizes, dtype=np.int64),
+             dropout_rate=dropout_rate)
+    print(f"Đã lưu lịch sử huấn luyện: {history_path}")
+    plot_training_history(history, plot_path, hidden_sizes, dropout_rate)
+
+
+def plot_training_history(history, plot_path, hidden_sizes,
+                          dropout_rate=DROPOUT_RATE):
+    import matplotlib.pyplot as plt
+
+    epochs = np.arange(1, len(history["train_loss"]) + 1)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].plot(epochs, history["train_loss"], marker="o", label="Train loss")
+    axes[0].plot(epochs, history["val_loss"], marker="o", label="Validation loss")
+    axes[0].set_title("Loss theo epoch")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Cross-entropy loss")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].plot(epochs, history["train_accuracy"], marker="o", label="Train accuracy")
+    axes[1].plot(epochs, history["val_accuracy"], marker="o", label="Validation accuracy")
+    axes[1].set_title("Accuracy theo epoch")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy")
+    axes[1].set_ylim(0, 1.02)
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    if "learning_rate" in history:
+        axes[2].plot(epochs, history["learning_rate"], marker="o", color="green")
+        axes[2].set_title("Learning rate decay")
+        axes[2].set_xlabel("Epoch")
+        axes[2].set_ylabel("Learning rate")
+        axes[2].grid(True, alpha=0.3)
+    else:
+        axes[2].axis("off")
+
+    architecture = " → ".join(map(str, (INPUT_SIZE, *hidden_sizes, OUTPUT_SIZE)))
+    fig.suptitle(
+        f"MLP {architecture} | "
+        f"SiLU, dropout={dropout_rate} (2 lớp cuối), augmentation ±8°/2px | "
+        f"α₀={ALPHA}, β₁={BETA1}, β₂={BETA2}, weight decay={WEIGHT_DECAY}"
+    )
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=160, bbox_inches="tight")
+    print(f"Đã lưu biểu đồ huấn luyện: {plot_path}")
+    plt.show()
+
+
+def show_saved_history(history_path="training_history.npz",
+                       plot_path="training_curves.png"):
+    data = np.load(history_path)
+    keys = ["train_loss", "val_loss", "train_accuracy", "val_accuracy"]
+    if "learning_rate" in data:
+        keys.append("learning_rate")
+    history = {key: data[key] for key in keys}
+    if "hidden_sizes" in data:
+        hidden_sizes = tuple(int(value) for value in data["hidden_sizes"])
+    else:
+        hidden_sizes = (int(data["hidden1"]), int(data["hidden2"]))
+    dropout_rate = float(data["dropout_rate"]) if "dropout_rate" in data else DROPOUT_RATE
+    plot_training_history(history, plot_path, hidden_sizes, dropout_rate)
+
+
+def interactive_menu():
+    """Menu train/test/chart; cấu hình mạng và optimizer được giữ cố định."""
+    while True:
+        print("\n=== MLP nhận diện chữ số ===")
+        print("1. Train mô hình 3 hidden layer và tạo biểu đồ loss/accuracy")
+        print("2. Test trên CSV số 10–20")
+        print("3. Tạo file submission.csv cho Kaggle")
+        print("4. Đối chiếu submission.csv với file nhãn tham khảo")
+        print("5. Mở lại biểu đồ loss/accuracy đã lưu")
+        print("6. Thoát")
+        choice = input("Chọn (1–6): ").strip()
+
+        if choice == "1":
+            csv_path = input("Đường dẫn train CSV [train.csv]: ").strip() or "train.csv"
+            try:
+                train(csv_path)
+            except (ValueError, OSError) as error:
+                print(f"Không train được: {error}")
+        elif choice == "2":
+            csv_path = input("Đường dẫn test CSV [test10-20.csv]: ").strip() or "test10-20.csv"
+            try:
+                test_csv(str(OUTPUT_DIR / "digit_mlp.npz"), csv_path)
+            except (ValueError, OSError) as error:
+                print(f"Không test được: {error}")
+        elif choice == "3":
+            csv_path = input("Đường dẫn test.csv [test.csv]: ").strip() or "test.csv"
+            output_path = input("File kết quả [submission.csv]: ").strip() or "submission.csv"
+            labels_path = input(
+                "File nhãn để đối chiếu [visual_labels_test_kaggle.csv] "
+                "(Enter để bỏ qua): "
+            ).strip() or "visual_labels_test_kaggle.csv"
+            try:
+                predict_csv(
+                    str(OUTPUT_DIR / "digit_mlp.npz"), csv_path, output_path,
+                    labels_path=labels_path,
+                )
+            except (ValueError, OSError) as error:
+                print(f"Không tạo được submission: {error}")
+        elif choice == "4":
+            submission_path = input("File dự đoán [submission.csv]: ").strip() or "submission.csv"
+            labels_path = input(
+                "File nhãn tham khảo [visual_labels_test_kaggle.csv]: "
+            ).strip() or "visual_labels_test_kaggle.csv"
+            try:
+                compare_accuracy(submission_path, labels_path)
+            except (ValueError, OSError) as error:
+                print(f"Không đối chiếu được: {error}")
+        elif choice == "5":
+            history_path = input(
+                f"File lịch sử [{OUTPUT_DIR / 'training_history.npz'}]: "
+            ).strip() or str(OUTPUT_DIR / "training_history.npz")
+            try:
+                show_saved_history(history_path, str(OUTPUT_DIR / "training_curves.png"))
+            except (ValueError, OSError, KeyError) as error:
+                print(f"Không mở được biểu đồ: {error}")
+        elif choice == "6":
+            print("Đã thoát.")
+            return
+        else:
+            print("Hãy chọn từ 1 đến 6.")
+
+
+def otsu_threshold(gray):
+    """Tính ngưỡng Otsu, không cần OpenCV."""
+    hist = np.bincount(gray.ravel(), minlength=256).astype(np.float64)
+    total = gray.size
+    sum_total = np.dot(np.arange(256), hist)
+    weight_bg = 0.0
+    sum_bg = 0.0
+    best_var = -1.0
+    best_t = 127
+
+    for t in range(256):
+        weight_bg += hist[t]
+        if weight_bg == 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+        sum_bg += t * hist[t]
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_total - sum_bg) / weight_fg
+        between_var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if between_var > best_var:
+            best_var, best_t = between_var, t
+
+    return best_t
+
+
+def gray_to_ink_mask(gray):
+    gray = np.asarray(gray, dtype=np.uint8)
+    if gray.shape != (28, 28):
+        raise ValueError(f"Ảnh cần có kích thước 28x28, nhận được {gray.shape}.")
+
+    threshold = otsu_threshold(gray)
+    # Tự xác định màu nền dựa trên viền ảnh.
+    border = np.concatenate((gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]))
+    if np.median(border) > 127:   # nền sáng, nét tối
+        ink = gray <= threshold
+    else:                         # nền tối, nét sáng (kiểu MNIST)
+        ink = gray > threshold
+
+    # Lọc các pixel đơn lẻ nhiễu: chỉ giữ pixel có láng giềng nét.
+    padded = np.pad(ink, 1, mode="constant")
+    neighbors = np.zeros_like(ink, dtype=np.uint8)
+    for dy in range(3):
+        for dx in range(3):
+            neighbors += padded[dy:dy + 28, dx:dx + 28]
+    ink &= neighbors >= 2
+    return (ink.astype(np.uint8) * 255)
+
+
+def get_ink_mask(image_path):
+    gray = np.asarray(Image.open(image_path).convert("L"), dtype=np.uint8)
+    return gray_to_ink_mask(gray)
+
+
+def split_two_digits(ink):
+    """Tách ở cột có ít nét nhất trong vùng quanh giữa ảnh."""
+    if not np.any(ink):
+        raise ValueError("Ảnh không có nét sau khi nhị phân hóa.")
+    projection = np.count_nonzero(ink, axis=0)
+    lo, hi = max(1, int(28 * 0.30)), min(26, int(28 * 0.70))
+    total_ink = int(projection.sum())
+    # Loại điểm cắt khiến gần như toàn bộ nét rơi vào cùng một phía.
+    minimum_side_ink = max(1, int(total_ink * 0.12))
+    candidates = [
+        c for c in range(lo, hi + 1)
+        if projection[:c].sum() >= minimum_side_ink
+        and projection[c:].sum() >= minimum_side_ink
+    ]
+    if not candidates:
+        raise ValueError("Không tìm được điểm cắt chia nét thành hai vùng.")
+    center = 13.5
+    cut = min(candidates, key=lambda c: (projection[c], abs(c - center)))
+
+    left = ink[:, :cut]
+    right = ink[:, cut:]
+    if not np.any(left) or not np.any(right):
+        raise ValueError("Không tách được hai chữ số; hãy kiểm tra ảnh đầu vào.")
+    return left, right, int(cut)
+
+
+def normalize_digit(crop):
+    """Cắt khung nét, giữ tỷ lệ, đặt vào 28x28 và căn trọng tâm."""
+    ys, xs = np.nonzero(crop)
+    if len(xs) == 0:
+        raise ValueError("Một vùng chữ số bị rỗng.")
+
+    crop = crop[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    h, w = crop.shape
+    scale = 20.0 / max(h, w)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+
+    small = Image.fromarray(crop).resize((new_w, new_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("L", (28, 28), 0)
+    canvas.paste(small, ((28 - new_w) // 2, (28 - new_h) // 2))
+    arr = np.asarray(canvas, dtype=np.uint8)
+
+    # Dịch trọng tâm về giữa ảnh, tương tự căn chỉnh kiểu MNIST.
+    mass = arr.astype(np.float64)
+    total = mass.sum()
+    if total > 0:
+        yy, xx = np.indices(arr.shape)
+        cx = (xx * mass).sum() / total
+        cy = (yy * mass).sum() / total
+        dx, dy = int(round(13.5 - cx)), int(round(13.5 - cy))
+        shifted = np.zeros_like(arr)
+        x0, y0 = max(0, dx), max(0, dy)
+        sx0, sy0 = max(0, -dx), max(0, -dy)
+        copy_w = min(28 - x0, 28 - sx0)
+        copy_h = min(28 - y0, 28 - sy0)
+        if copy_w > 0 and copy_h > 0:
+            shifted[y0:y0 + copy_h, x0:x0 + copy_w] = \
+                arr[sy0:sy0 + copy_h, sx0:sx0 + copy_w]
+        arr = shifted
+
+    return arr.astype(np.float32).reshape(1, INPUT_SIZE) / 255.0
+
+
+def predict_from_gray(model, gray):
+    ink = gray_to_ink_mask(gray)
+    left, right, cut = split_two_digits(ink)
+
+    digit_probabilities = []
+    for crop in (left, right):
+        x = normalize_digit(crop)
+        probs = model.predict_proba(x)[0]
+        digit_probabilities.append(probs)
+
+    # Chỉ xét các cặp chữ số tạo thành class hợp lệ từ 10 đến 20.
+    p_tens, p_units = digit_probabilities
+    candidates = [(10 + unit, float(p_tens[1] * p_units[unit]))
+                  for unit in range(10)]
+    candidates.append((20, float(p_tens[2] * p_units[0])))
+    number, _ = max(candidates, key=lambda item: item[1])
+    digits = [number // 10, number % 10]
+    confidences = [float(p_tens[digits[0]]), float(p_units[digits[1]])]
+    return number, digits, confidences, cut
+
+
+def predict(model_path, image_path):
+    model = MLP.load(model_path)
+    gray = np.asarray(Image.open(image_path).convert("L"), dtype=np.uint8)
+    if gray.shape != (28, 28):
+        raise ValueError(f"Ảnh cần có kích thước 28x28, nhận được {gray.shape}.")
+    number, digits, confidences, cut = predict_from_gray(model, gray)
+    print(f"Vị trí cắt: cột {cut}")
+    print(f"Dự đoán chữ số: {digits[0]} (xác suất {confidences[0]:.3f})")
+    print(f"Dự đoán chữ số: {digits[1]} (xác suất {confidences[1]:.3f})")
+    print(f"Số dự đoán: {number}")
+    if not 10 <= number <= 20:
+        print("Cảnh báo: kết quả nằm ngoài khoảng 10–20.")
+    return number
+
+
+def load_number_csv(filename, has_labels):
+    """Đọc ảnh số 28x28: 784 pixel, có thể có thêm cột nhãn đầu tiên."""
+    data = np.loadtxt(filename, delimiter=",", skiprows=1, dtype=np.float32)
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    expected_cols = INPUT_SIZE + int(has_labels)
+    if data.ndim != 2 or data.shape[1] != expected_cols:
+        raise ValueError(
+            f"CSV {'có nhãn' if has_labels else 'không nhãn'} cần {expected_cols} cột, "
+            f"nhưng file có {data.shape[1] if data.ndim == 2 else 'định dạng sai'} cột."
+        )
+    if has_labels:
+        labels = data[:, 0].astype(np.int64)
+        pixels = data[:, 1:]
+        if np.any((labels < 10) | (labels > 20)):
+            raise ValueError("Nhãn trong test CSV phải nằm trong khoảng 10–20.")
+        return pixels, labels
+    return data, None
+
+
+def load_kaggle_test_csv(filename):
+    """Đọc Kaggle test.csv theo dạng id,pixel0,...,pixel783."""
+    ids, rows = [], []
+    expected_header = ["id"] + [f"pixel{i}" for i in range(INPUT_SIZE)]
+    with open(filename, "r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.reader(file)
+        header = next(reader, None)
+        if header is None or [name.strip() for name in header] != expected_header:
+            raise ValueError(
+                "test.csv cần header id,pixel0,...,pixel783 theo đúng thứ tự."
+            )
+        for line_number, row in enumerate(reader, start=2):
+            if not row:
+                continue
+            if len(row) != INPUT_SIZE + 1:
+                raise ValueError(
+                    f"Dòng {line_number} có {len(row)} cột; cần 785 cột (id + 784 pixel)."
+                )
+            sample_id = row[0].strip()
+            if not sample_id:
+                raise ValueError(f"Dòng {line_number} thiếu id.")
+            try:
+                pixels = [float(value) for value in row[1:]]
+            except ValueError as error:
+                raise ValueError(f"Pixel không hợp lệ ở dòng {line_number}.") from error
+            if not np.all(np.isfinite(pixels)):
+                raise ValueError(f"Pixel không hữu hạn ở dòng {line_number}.")
+            ids.append(sample_id)
+            rows.append(pixels)
+
+    if not rows:
+        raise ValueError("test.csv không chứa ảnh nào.")
+    if len(set(ids)) != len(ids):
+        raise ValueError("Cột id trong test.csv có giá trị trùng lặp.")
+    return ids, np.asarray(rows, dtype=np.float32)
+
+
+def test_csv(model_path, csv_path):
+    """Đánh giá trên CSV: label 10..20, sau đó là 784 pixel của ảnh 28x28."""
+    model = MLP.load(model_path)
+    pixels, labels = load_number_csv(csv_path, has_labels=True)
+    predictions = []
+    failures = 0
+    for index, row in enumerate(pixels):
+        gray = np.clip(row.reshape(28, 28), 0, 255).astype(np.uint8)
+        try:
+            prediction, _, _, _ = predict_from_gray(model, gray)
+            predictions.append(prediction)
+        except ValueError as error:
+            failures += 1
+            predictions.append(-1)  # tính là sai, nhưng tiếp tục các ảnh sau
+            if failures <= 5:
+                print(f"Ảnh dòng {index + 2}: không tách được ({error})")
+
+    predictions = np.asarray(predictions)
+    accuracy = np.mean(predictions == labels)
+    print(f"Số ảnh test: {len(labels)}")
+    print(f"Ảnh không tách được: {failures}")
+    print(f"Accuracy toàn số: {accuracy:.4%}")
+    print("Một số kết quả (nhãn thật -> dự đoán):")
+    for true_label, predicted in list(zip(labels, predictions))[:10]:
+        print(f"  {true_label:2d} -> {predicted:2d}")
+
+
+def load_id_labels_csv(filename, description):
+    """Đọc CSV có đúng hai cột id,label; trả về ánh xạ id -> nhãn."""
+    labels_by_id = {}
+    with open(filename, "r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None or [name.strip() for name in reader.fieldnames] != ["id", "label"]:
+            raise ValueError(f"{description} cần header đúng dạng id,label.")
+        for line_number, row in enumerate(reader, start=2):
+            sample_id = (row.get("id") or "").strip()
+            raw_label = (row.get("label") or "").strip()
+            if not sample_id:
+                raise ValueError(f"{description}: dòng {line_number} thiếu id.")
+            if sample_id in labels_by_id:
+                raise ValueError(f"{description}: id={sample_id} bị trùng.")
+            try:
+                label = int(raw_label)
+            except ValueError as error:
+                raise ValueError(
+                    f"{description}: nhãn không hợp lệ ở dòng {line_number}."
+                ) from error
+            if not 10 <= label <= 20:
+                raise ValueError(
+                    f"{description}: nhãn id={sample_id} phải nằm trong khoảng 10–20."
+                )
+            labels_by_id[sample_id] = label
+    if not labels_by_id:
+        raise ValueError(f"{description} không có dữ liệu.")
+    return labels_by_id
+
+
+def compare_accuracy(submission_path, labels_path):
+    """So sánh file submission id,label với file nhãn tham khảo theo id."""
+    predictions = load_id_labels_csv(submission_path, "File submission")
+    references = load_id_labels_csv(labels_path, "File nhãn tham khảo")
+    missing_labels = sorted(set(predictions) - set(references))
+    missing_predictions = sorted(set(references) - set(predictions))
+    if missing_labels or missing_predictions:
+        details = []
+        if missing_labels:
+            details.append(
+                f"thiếu nhãn cho {len(missing_labels)} id trong submission "
+                f"(ví dụ: {', '.join(missing_labels[:5])})"
+            )
+        if missing_predictions:
+            details.append(
+                f"file nhãn có {len(missing_predictions)} id không có trong submission "
+                f"(ví dụ: {', '.join(missing_predictions[:5])})"
+            )
+        raise ValueError("Hai file không khớp danh sách id: " + "; ".join(details))
+
+    total = len(predictions)
+    correct = sum(predictions[sample_id] == references[sample_id] for sample_id in predictions)
+    accuracy = correct / total
+    print(f"Số mẫu đối chiếu: {total}")
+    print(f"Dự đoán trùng nhãn tham khảo: {correct}/{total}")
+    print(f"Accuracy đối chiếu với nhãn tham khảo: {accuracy:.4%}")
+    print("Lưu ý: đây là mức khớp với file nhãn tham khảo, không phải accuracy Kaggle chính thức.")
+    return accuracy
+
+
+def predict_csv(model_path, csv_path, output_path, labels_path=None):
+    """Dự đoán Kaggle test.csv; có thể đối chiếu ngay với file nhãn tham khảo."""
+    model = MLP.load(model_path)
+    ids, pixels = load_kaggle_test_csv(csv_path)
+    predictions = []
+    for index, row in enumerate(pixels):
+        gray = np.clip(row.reshape(28, 28), 0, 255).astype(np.uint8)
+        try:
+            prediction, _, _, _ = predict_from_gray(model, gray)
+        except ValueError as error:
+            raise ValueError(
+                f"Không xử lý được ảnh id={ids[index]} (dòng {index + 2}): {error}"
+            ) from error
+        predictions.append(prediction)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["id", "label"])
+        writer.writerows(zip(ids, predictions))
+    print(f"Đã dự đoán {len(predictions)} ảnh. File Kaggle: {output_path}")
+    if labels_path:
+        compare_accuracy(output_path, labels_path)
+
+
+def visualize_csv_row(model_path, csv_path, row_index):
+    """Vẽ ảnh gốc, điểm cắt, hai chữ đã chuẩn hóa và dự đoán."""
+    import matplotlib.pyplot as plt
+
+    model = MLP.load(model_path)
+    pixels, labels = load_number_csv(csv_path, has_labels=True)
+    if row_index < 0 or row_index >= len(pixels):
+        raise IndexError(f"row phải nằm trong khoảng 0 đến {len(pixels) - 1}.")
+
+    gray = np.clip(pixels[row_index].reshape(28, 28), 0, 255).astype(np.uint8)
+    mask = gray_to_ink_mask(gray)
+    left, right, cut = split_two_digits(mask)
+    left_norm = normalize_digit(left).reshape(28, 28)
+    right_norm = normalize_digit(right).reshape(28, 28)
+
+    predicted, digits, confidence, _ = predict_from_gray(model, gray)
+    true_label = int(labels[row_index])
+
+    fig, axes = plt.subplots(1, 4, figsize=(11, 3))
+    axes[0].imshow(gray, cmap="gray", vmin=0, vmax=255)
+    axes[0].set_title(f"Ảnh gốc — nhãn {true_label}")
+
+    axes[1].imshow(mask, cmap="gray", vmin=0, vmax=255)
+    axes[1].axvline(cut - 0.5, color="red", linewidth=1.5)
+    axes[1].set_title(f"Nhị phân + cắt tại cột {cut}")
+
+    axes[2].imshow(left_norm, cmap="gray", vmin=0, vmax=1)
+    axes[2].set_title(f"Chữ 1 → {digits[0]} ({confidence[0]:.2f})")
+
+    axes[3].imshow(right_norm, cmap="gray", vmin=0, vmax=1)
+    axes[3].set_title(f"Chữ 2 → {digits[1]} ({confidence[1]:.2f})")
+
+    for ax in axes:
+        ax.axis("off")
+    fig.suptitle(f"Dự đoán: {predicted} | Nhãn thật: {true_label}")
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Nhận diện số viết tay 10–20 bằng MLP."
+    )
+    subparsers = parser.add_subparsers(dest="mode")
+
+    p_train = subparsers.add_parser("train", help="Huấn luyện MLP từ MNIST CSV")
+    p_train.add_argument("csv", help="CSV có nhãn 0–9 và 784 pixel")
+    # Cấu hình train cố định; chỉ cần truyền đường dẫn CSV.
+
+    p_predict = subparsers.add_parser("predict", help="Dự đoán ảnh hai chữ số")
+    p_predict.add_argument("image", help="Ảnh xám 28x28 chứa một số 10–20")
+    p_predict.add_argument("--model", default=str(OUTPUT_DIR / "digit_mlp.npz"))
+
+    p_test = subparsers.add_parser("test", help="Đánh giá CSV có nhãn 10–20")
+    p_test.add_argument("csv", help="CSV: label (10–20) + 784 pixel")
+    p_test.add_argument("--model", default=str(OUTPUT_DIR / "digit_mlp.npz"))
+
+    p_predict_csv = subparsers.add_parser(
+        "predict-csv", help="Tạo submission Kaggle từ test.csv có id và 784 pixel"
+    )
+    p_predict_csv.add_argument("csv", help="test.csv: id,pixel0,...,pixel783")
+    p_predict_csv.add_argument("--model", default=str(OUTPUT_DIR / "digit_mlp.npz"))
+    p_predict_csv.add_argument("--output", default="submission.csv")
+    p_predict_csv.add_argument(
+        "--labels", help="CSV nhãn tham khảo id,label để in accuracy đối chiếu"
+    )
+
+    p_compare = subparsers.add_parser(
+        "compare-accuracy", help="So sánh submission.csv với CSV nhãn id,label"
+    )
+    p_compare.add_argument("submission", help="CSV dự đoán gồm id,label")
+    p_compare.add_argument("labels", help="CSV nhãn tham khảo gồm id,label")
+
+    p_plot = subparsers.add_parser("plot-history", help="Mở biểu đồ loss/accuracy đã lưu")
+    p_plot.add_argument("--history", default=str(OUTPUT_DIR / "training_history.npz"))
+    p_plot.add_argument("--plot", default=str(OUTPUT_DIR / "training_curves.png"))
+
+    args = parser.parse_args()
+    if args.mode is None:
+        interactive_menu()
+        return
+    if args.mode == "train":
+        train(args.csv)
+    elif args.mode == "predict":
+        predict(args.model, args.image)
+    elif args.mode == "test":
+        test_csv(args.model, args.csv)
+    elif args.mode == "predict-csv":
+        predict_csv(args.model, args.csv, args.output, labels_path=args.labels)
+    elif args.mode == "compare-accuracy":
+        compare_accuracy(args.submission, args.labels)
+    elif args.mode == "plot-history":
+        show_saved_history(args.history, args.plot)
+    else:
+        parser.error("Chế độ không hợp lệ")
+
+
+if __name__ == "__main__":
+    main()
